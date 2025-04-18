@@ -50,7 +50,9 @@ namespace HttpPostSender
         private static int timeField = Int32.Parse(ConfigurationManager.AppSettings["timeField"]);
         private static bool setToCurrentTime = Boolean.Parse(ConfigurationManager.AppSettings["setToCurrentTime"]);
         private static string dateFormat = ConfigurationManager.AppSettings["dateFormat"];
-        private static CultureInfo dateCulture = CultureInfo.CreateSpecificCulture(ConfigurationManager.AppSettings["dateCulture"]);
+        //private static CultureInfo dateCulture = CultureInfo.CreateSpecificCulture(ConfigurationManager.AppSettings["dateCulture"]);
+        private static string dateCulture = ConfigurationManager.AppSettings["dateCulture"];
+
         private static bool repeatSimulation = Boolean.Parse(ConfigurationManager.AppSettings["repeatSimulation"]);
 
         private static readonly HttpClient client = new HttpClient();
@@ -170,6 +172,10 @@ namespace HttpPostSender
                         
                         //dynamic[] values = line.Split(fieldDelimiter);
                         string[] values = Regex.Split(line, $"{fieldDelimiter}(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
+                        //Debug, what is being parsed? 
+                        Console.WriteLine($"[DEBUG] Parsed line: {line}");
+                        Console.WriteLine($"[DEBUG] Parsed values: {string.Join(" | ", values)}");
+
                         if (sendInterval == -1)
                         {
                             timeString = values[timeField];
@@ -201,6 +207,7 @@ namespace HttpPostSender
                             if (String.IsNullOrEmpty(dateFormat))
                             {
                                 //Console.WriteLine("setting time value");
+                                var culture = new System.Globalization.CultureInfo(dateCulture);
                                 string dt = new DateTimeOffset(DateTime.Now).ToUnixTimeMilliseconds().ToString();
                                 values[timeField] = dt;
                                 //Console.WriteLine("done setting time value");
@@ -208,10 +215,11 @@ namespace HttpPostSender
                             else
                             {
                                 try{
-                                    string dt = DateTime.Now.ToString(dateFormat,dateCulture);
+                                    string dt = DateTime.UtcNow.ToString(dateFormat, new CultureInfo(dateCulture));
                                     values[timeField] = dt;
                                 }
                                 catch(Exception e){
+                                    Console.WriteLine($"[Warning] Failed to parse data value: {e.Message}");
                                     string dt = new DateTimeOffset(DateTime.Now).ToUnixTimeMilliseconds().ToString();
                                     values[timeField] = dt;
                                 }
@@ -227,7 +235,12 @@ namespace HttpPostSender
                                 decimal decVal = 0;
                                 bool isLong = long.TryParse(values[i], out longVal);
                                 bool isDec = decimal.TryParse(values[i], out decVal);
-                                schema[fields[i]] = isLong ? longVal : isDec ? decVal : values[i];
+                                if (isLong)
+                                    schema[fields[i]] = longVal;
+                                else if (isDec)
+                                    schema[fields[i]] = decVal;
+                                else    schema[fields[i]] = values[i];
+                                //schema[fields[i]] = isLong ? longVal.ToString() : isDec ? decVal.ToString() : values[i];
                             }
                             //Console.WriteLine($"Schema: {schema}");
                         }
@@ -245,7 +258,7 @@ namespace HttpPostSender
 
                         //Console.WriteLine($"Line #: {l}; Index: {j}");
                         if (convertToJson){
-                            messageBatch[j] = schema;
+                            messageBatch[j] = schema.DeepClone();
                         }
                         else{                   
                             //string message = string.Join(fieldDelimiter, values) + "\r\n";   
@@ -256,29 +269,73 @@ namespace HttpPostSender
                         {                           
                             // send the batch of events to the REST endpoint
                             //string payload = JsonConvert.SerializeObject(eventBatch);
-                            string payload = convertToJson ? JsonConvert.SerializeObject(messageBatch) : "\r\n"+string.Join("\r\n", messageBatch);                            
+                            string payload = convertToJson ? JsonConvert.SerializeObject(messageBatch) : "\r\n"+string.Join("\r\n", messageBatch);  
+                            Console.WriteLine("[DEBUG] Payload being sent:");
+                            Console.WriteLine(payload);                          
                             //Console.WriteLine($"Payload: {payload}");
                             var content = new StringContent(payload, System.Text.Encoding.UTF8, convertToJson ? "application/json" : "text/plain");
                             content.Headers.ContentType = new MediaTypeHeaderValue(convertToJson ? "application/json" : "text/plain");
                             //if the request failed because the token expired, get a new one and retry the request
-                            try{
-                                var response = await client.PostAsync(receiverUrl, content); 
-                                var responseString = await response.Content.ReadAsStringAsync();
-                                dynamic responseJson = JsonConvert.DeserializeObject(responseString);
-                                if (!response.IsSuccessStatusCode && responseJson["error"]["code"] == 403 && authenticationArcGIS){                                    
-                                    Console.WriteLine($"Renewing the token for {username}");
-                                    string tokenStr = await getToken(tokenPortalUrl,username,password,21600);                     
-                                    if (tokenStr.Contains("Unable to generate token.")){
-                                        Console.WriteLine(tokenStr);
-                                        return;
-                                    }                 
-                                    dynamic tokenJson = JsonConvert.DeserializeObject(tokenStr); 
-                                    token = tokenJson["token"];                                    
-                                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer",token);
-                                    response = await client.PostAsync(receiverUrl, content); 
-                                    responseString = await response.Content.ReadAsStringAsync();
-                                    responseJson = JsonConvert.DeserializeObject(responseString);                               
-                                }
+                            try
+{
+    var response = await client.PostAsync(receiverUrl, content);
+    var responseString = await response.Content.ReadAsStringAsync();
+
+    dynamic responseJson = null;
+    bool isJsonResponse = responseString.TrimStart().StartsWith("{") || responseString.TrimStart().StartsWith("[");
+    if (isJsonResponse)
+    {
+        try
+        {
+            responseJson = JsonConvert.DeserializeObject(responseString);
+        }
+        catch (JsonReaderException jex)
+        {
+            Console.WriteLine("[ERROR] Failed to parse JSON response:");
+            Console.WriteLine(responseString);
+            Console.WriteLine($"Details: {jex.Message}");
+        }
+    }
+    else
+    {
+        Console.WriteLine("[INFO] Response was not JSON. Raw response:");
+        Console.WriteLine(responseString);
+    }
+
+    if (!response.IsSuccessStatusCode && responseJson != null &&
+        responseJson["error"] != null && responseJson["error"]["code"] == 403 &&
+        authenticationArcGIS)
+    {
+        Console.WriteLine($"Renewing the token for {username}");
+        string tokenStr = await getToken(tokenPortalUrl, username, password, 21600);
+        if (tokenStr.Contains("Unable to generate token."))
+        {
+            Console.WriteLine(tokenStr);
+            return;
+        }
+        dynamic tokenJson = JsonConvert.DeserializeObject(tokenStr);
+        token = tokenJson["token"];
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        response = await client.PostAsync(receiverUrl, content);
+        responseString = await response.Content.ReadAsStringAsync();
+
+        if (responseString.TrimStart().StartsWith("{") || responseString.TrimStart().StartsWith("["))
+        {
+            try
+            {
+                responseJson = JsonConvert.DeserializeObject(responseString);
+            }
+            catch (JsonReaderException jex)
+            {
+                Console.WriteLine("[ERROR] Failed to parse JSON response on retry:");
+                Console.WriteLine(responseString);
+                Console.WriteLine($"Details: {jex.Message}");
+            }
+        }
+    }
+
+
                                 //countTotal += count;
                                 stopwatch.Stop();
                                 int elapsed_time = (int)stopwatch.ElapsedMilliseconds;                                
